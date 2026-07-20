@@ -52,7 +52,8 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 BASE44_APP_URL = os.environ["BASE44_APP_URL"].rstrip("/")
 BASE44_SERVICE_TOKEN = os.environ.get("BASE44_SERVICE_TOKEN", "")
 ANAM_API_KEY = os.environ["ANAM_API_KEY"]
-ANAM_PERSONA_ID = os.environ["ANAM_PERSONA_ID"]  # la Persona ya configurada con llmId: CUSTOMER_CLIENT_V1
+ANAM_AVATAR_ID = os.environ["ANAM_AVATAR_ID"]  # ID del avatar de Héctor
+ANAM_VOICE_ID = os.environ["ANAM_VOICE_ID"]    # ID de la voz clonada de Héctor
 
 CLAUDE_MODEL = "claude-sonnet-5"
 
@@ -206,8 +207,11 @@ async def session_token():
             },
             json={
                 "personaConfig": {
-                    "id": ANAM_PERSONA_ID,
+                    "name": "Gemelo Digital de Héctor Padilla",
+                    "avatarId": ANAM_AVATAR_ID,
+                    "voiceId": ANAM_VOICE_ID,
                     "llmId": "CUSTOMER_CLIENT_V1",  # fuerza el modo "yo controlo las respuestas"
+                    "systemPrompt": SYSTEM_PROMPT,
                 }
             },
             timeout=10,
