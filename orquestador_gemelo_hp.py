@@ -164,6 +164,14 @@ def construir_mensajes_claude(
                 f"[Pregunta del usuario]\n{ultimo['content']}"
             )
 
+    # Claude exige que la conversación termine en un mensaje "user".
+    # A veces Anam dispara MESSAGE_HISTORY_UPDATED con el historial
+    # terminando en "assistant" (ej. justo después de que el avatar
+    # termina de hablar) — recortamos esos mensajes finales para
+    # evitar el error 400 "must end with a user message".
+    while mensajes and mensajes[-1]["role"] != "user":
+        mensajes.pop()
+
     return mensajes
 
 
@@ -247,6 +255,10 @@ async def chat_stream(request: Request):
 
     # Paso 2: armar mensajes para Claude
     mensajes = construir_mensajes_claude(historial, conocimiento)
+
+    if not mensajes:
+        logger.info("No hay mensaje de usuario válido para responder; se ignora.")
+        return StreamingResponse(iter([]), media_type="text/plain")
 
     # Paso 3: responder en streaming
     return StreamingResponse(
