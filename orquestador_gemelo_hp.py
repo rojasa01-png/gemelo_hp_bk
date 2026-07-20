@@ -128,7 +128,7 @@ def obtener_conocimiento_base44(pregunta: str) -> str:
             url,
             headers=headers,
             json={"query": pregunta},
-            timeout=5,  # no queremos que una consulta lenta arruine la latencia de la conversación
+            timeout=8,  # Base44 a veces tarda más de 5s; 8s da más margen sin arruinar la latencia
         )
         response.raise_for_status()
         data = response.json()
@@ -220,6 +220,15 @@ async def session_token():
                     "voiceId": ANAM_VOICE_ID,
                     "llmId": "CUSTOMER_CLIENT_V1",  # fuerza el modo "yo controlo las respuestas"
                     "systemPrompt": SYSTEM_PROMPT,
+                    "languageCode": "es",  # evita que el STT transcriba/traduzca a inglés
+                    "voiceDetectionOptions": {
+                        # 0 = espera hasta estar seguro de que terminaste; 1 = responde muy rápido.
+                        # Lo bajamos para que no corte a media frase.
+                        "endOfSpeechSensitivity": 0.3,
+                        # Cuánto tolera una pausa natural a media oración antes de asumir
+                        # que ya terminaste de hablar.
+                        "silenceBeforeAutoEndTurnSeconds": 1.5,
+                    },
                 }
             },
             timeout=10,
