@@ -4,39 +4,64 @@ Orquestador: Base44 -> Claude -> Anam
 
 Este servidor es el "cerebro intermedio" del gemelo digital en vivo.
 
-Flujo:
-  1. Anam manda el historial de la conversación a este servidor
-     (modo Custom LLM, llmId: "CUSTOMER_CLIENT_V1").
-  2. Este servidor le pregunta a Base44 qué conocimiento es relevante
-     para la última pregunta del usuario.
-  3. Arma el prompt final (system prompt de gemelo_hp + conocimiento + historial).
-  4. Llama a Claude con ese prompt.
-  5. Regresa la respuesta a Anam en streaming, para que la convierta
+Dos formas de conectarlo con Anam (las dos funcionan al mismo tiempo):
+
+  A) Cliente (la actual, llmId "CUSTOMER_CLIENT_V1"):
+     el navegador escucha MESSAGE_HISTORY_UPDATED, llama a POST /chat-stream
+     y le pasa el texto a Anam con talk(). Hay un viaje extra por el navegador.
+
+  B) Servidor (nueva, recomendada para bajar latencia):
+     Anam llama directo a POST /v1/chat/completions (formato OpenAI, SSE).
+     Se activa poniendo ANAM_LLM_ID en el entorno (ver README al final).
+
+Flujo en ambos casos:
+  1. Se recibe el historial de la conversación.
+  2. Se consulta a Base44 qué conocimiento es relevante (con timeout corto).
+  3. Se arma el prompt final (system prompt + conocimiento + historial).
+  4. Se llama a Claude en streaming.
+  5. La respuesta regresa token por token para que Anam la convierta
      en voz + animación facial.
 
 Requisitos (requirements.txt):
     fastapi
-    uvicorn
-    requests
+    uvicorn[standard]
+    httpx
     anthropic
     python-dotenv
 
 Correr localmente:
     uvicorn orquestador_gemelo_hp:app --reload --port 8000
 
-Variables de entorno necesarias (archivo .env, NUNCA subir a git):
+Variables de entorno (archivo .env, NUNCA subir a git):
     ANTHROPIC_API_KEY=sk-ant-...
     BASE44_APP_URL=https://tu-app.base44.app
-    BASE44_SERVICE_TOKEN=...      # si Base44 requiere un token para asServiceRole
+    BASE44_SERVICE_TOKEN=...        # si Base44 lo requiere
+    ANAM_API_KEY=...
+    ANAM_AVATAR_ID=...
+    ANAM_VOICE_ID=...
+
+  Opcionales:
+    ANAM_AVATAR_MODEL=cara-4.1-express   # "" para no mandarlo
+    ANAM_LLM_ID=...                      # activa el modo servidor (B)
+    ANAM_LLM_SECRET=...                  # secreto que Anam manda como Bearer
+    CLAUDE_MODEL=claude-sonnet-5
+    CLAUDE_MAX_TOKENS=300
+    BASE44_TIMEOUT_SECONDS=2.0
+    KNOWLEDGE_MIN_WORDS=3
+    END_OF_SPEECH_SENSITIVITY=0.3
+    SILENCE_BEFORE_AUTO_END_TURN_SECONDS=1.5
+    FRONTEND_ORIGIN=https://tu-frontend.vercel.app
 """
 
 import os
 import json
+import time
 import logging
-from typing import List, Dict, Any
+from contextlib import asynccontextmanager
+from typing import List, Dict, Any, AsyncIterator
 
-import requests
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
@@ -55,13 +80,47 @@ ANAM_API_KEY = os.environ["ANAM_API_KEY"]
 ANAM_AVATAR_ID = os.environ["ANAM_AVATAR_ID"]  # ID del avatar de Héctor
 ANAM_VOICE_ID = os.environ["ANAM_VOICE_ID"]    # ID de la voz clonada de Héctor
 
-CLAUDE_MODEL = "claude-sonnet-5"
+# Modelo de avatar de Anam. cara-4.1-express (20-oct-2026): animación más
+# expresiva y mejor lip sync. Si tu avatar actual no lo soporta, el session
+# token se reintenta automáticamente sin este campo (ver /session-token).
+ANAM_AVATAR_MODEL = os.environ.get("ANAM_AVATAR_MODEL", "cara-4.1-express")
+
+# Si defines ANAM_LLM_ID (el id que regresa POST https://api.anam.ai/v1/llms),
+# Anam llama directo a /v1/chat/completions y se elimina el viaje por el navegador.
+ANAM_LLM_ID = os.environ.get("ANAM_LLM_ID", "")
+ANAM_LLM_SECRET = os.environ.get("ANAM_LLM_SECRET", "")
+
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
+# Respuestas habladas: más cortas = el avatar termina antes y se siente más ágil.
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "300"))
+
+# Base44 es lo único que corre ANTES del primer token de Claude, así que su
+# timeout se suma directo a la latencia. Antes: 8 s. Ahora 2 s por defecto.
+BASE44_TIMEOUT_SECONDS = float(os.environ.get("BASE44_TIMEOUT_SECONDS", "2.0"))
+# Mensajes muy cortos ("sí", "ok", "gracias") no necesitan buscar conocimiento.
+KNOWLEDGE_MIN_WORDS = int(os.environ.get("KNOWLEDGE_MIN_WORDS", "3"))
+
+END_OF_SPEECH_SENSITIVITY = float(os.environ.get("END_OF_SPEECH_SENSITIVITY", "0.3"))
+SILENCE_BEFORE_AUTO_END_TURN_SECONDS = float(
+    os.environ.get("SILENCE_BEFORE_AUTO_END_TURN_SECONDS", "1.5")
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("orquestador_gemelo_hp")
 
-app = FastAPI(title="Orquestador Gemelo Digital HP")
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# Clientes asíncronos y compartidos: no bloquean el event loop de FastAPI y
+# reutilizan conexiones (se evita el handshake TLS en cada turno).
+claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+http_client = httpx.AsyncClient(timeout=10.0)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await http_client.aclose()
+
+
+app = FastAPI(title="Orquestador Gemelo Digital HP", lifespan=lifespan)
 
 # CORS: el frontend (la página HTML/JS con el SDK de Anam) va a vivir en
 # otro dominio (ej. Vercel/Netlify), así que el navegador necesita permiso
@@ -78,12 +137,12 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# System prompt recortado (la versión que ya probamos en Anam).
+# System prompt (la versión que ya probamos en Anam) + reglas de voz.
 # En producción, esto podría vivir en un archivo aparte (system_prompt.txt)
 # en vez de estar embebido aquí.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_BASE = """
 Eres el gemelo digital de Héctor Padilla Maya — estratega de negocios,
 Board Advisor y fundador de Grupo Scanda / MAIA y Tadah Digital Marketing.
 Piensas, hablas y decides como Héctor: directo, estratégico, retador,
@@ -104,37 +163,58 @@ Héctor (ver más abajo, si los hay). Si el conocimiento no cubre la
 pregunta, dilo honestamente en vez de inventar.
 """.strip()
 
+# Todo lo que escribe Claude se convierte en voz. Markdown, listas o emojis
+# se leerían raro o se leerían literalmente, y las respuestas largas se
+# sienten lentas aunque el primer token llegue rápido.
+REGLAS_DE_VOZ = """
+Formato de voz (obligatorio): tu respuesta se va a decir en voz alta.
+Habla en 1 a 4 oraciones cortas, como en una conversación real. Sin
+markdown, sin listas, sin viñetas, sin emojis, sin encabezados. Si el
+tema es largo, da la idea principal y pregunta si quieren que profundices.
+""".strip()
+
+SYSTEM_PROMPT = f"{SYSTEM_PROMPT_BASE}\n\n{REGLAS_DE_VOZ}"
+
 
 # ---------------------------------------------------------------------------
 # Paso 1: consultar Base44 por conocimiento relevante
 # ---------------------------------------------------------------------------
 
-def obtener_conocimiento_base44(pregunta: str) -> str:
+async def obtener_conocimiento_base44(pregunta: str) -> str:
     """
     Llama a la función de backend de Base44 (getKnowledgeForQuery)
     y regresa el fragmento de conocimiento relevante como texto plano.
 
-    Si Base44 no responde o falla, regresa cadena vacía en vez de
+    Si Base44 no responde a tiempo o falla, regresa cadena vacía en vez de
     tronar todo el flujo (el gemelo puede seguir respondiendo sin
     ese contexto adicional).
     """
+    if len(pregunta.split()) < KNOWLEDGE_MIN_WORDS:
+        return ""
+
     url = f"{BASE44_APP_URL}/api/functions/getKnowledgeForQuery"
     headers = {"Content-Type": "application/json"}
     if BASE44_SERVICE_TOKEN:
         headers["Authorization"] = f"Bearer {BASE44_SERVICE_TOKEN}"
 
+    inicio = time.perf_counter()
     try:
-        response = requests.post(
+        response = await http_client.post(
             url,
             headers=headers,
             json={"query": pregunta},
-            timeout=8,  # Base44 a veces tarda más de 5s; 8s da más margen sin arruinar la latencia
+            timeout=BASE44_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         data = response.json()
+        logger.info("Base44 respondió en %.0f ms", (time.perf_counter() - inicio) * 1000)
         return data.get("knowledge", "")
-    except requests.RequestException as exc:
-        logger.warning("Base44 no respondió a tiempo o falló: %s", exc)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning(
+            "Base44 no respondió a tiempo o falló (%.0f ms): %s",
+            (time.perf_counter() - inicio) * 1000,
+            exc,
+        )
         return ""
 
 
@@ -142,35 +222,57 @@ def obtener_conocimiento_base44(pregunta: str) -> str:
 # Paso 2: armar el prompt final para Claude
 # ---------------------------------------------------------------------------
 
+def _texto_de_contenido(content: Any) -> str:
+    """El formato OpenAI permite content como string o como lista de partes."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            parte.get("text", "") for parte in content if isinstance(parte, dict)
+        )
+    return ""
+
+
 def construir_mensajes_claude(
-    historial: List[Dict[str, str]], conocimiento: str
+    historial: List[Dict[str, Any]], conocimiento: str
 ) -> List[Dict[str, str]]:
     """
-    Convierte el historial de Anam (lista de {role, content}) al formato
-    que espera la API de Claude, e inyecta el conocimiento recuperado
-    de Base44 como contexto adicional antes de la última pregunta.
+    Convierte el historial (lista de {role, content}) al formato que espera
+    la API de Claude, e inyecta el conocimiento recuperado de Base44 como
+    contexto adicional antes de la última pregunta.
     """
-    mensajes = []
+    mensajes: List[Dict[str, str]] = []
 
     for turno in historial:
-        rol = "user" if turno.get("role") == "user" else "assistant"
-        mensajes.append({"role": rol, "content": turno.get("content", "")})
-
-    if conocimiento and mensajes:
-        ultimo = mensajes[-1]
-        if ultimo["role"] == "user":
-            ultimo["content"] = (
-                f"[Conocimiento relevante de Base44]\n{conocimiento}\n\n"
-                f"[Pregunta del usuario]\n{ultimo['content']}"
-            )
+        rol_original = turno.get("role")
+        if rol_original == "system":
+            continue  # el system prompt va aparte, en el parámetro `system`
+        rol = "user" if rol_original == "user" else "assistant"
+        texto = _texto_de_contenido(turno.get("content", ""))
+        if not texto:
+            continue
+        # Claude exige roles alternados; si llegan dos seguidos, se unen.
+        if mensajes and mensajes[-1]["role"] == rol:
+            mensajes[-1]["content"] += f"\n{texto}"
+        else:
+            mensajes.append({"role": rol, "content": texto})
 
     # Claude exige que la conversación termine en un mensaje "user".
-    # A veces Anam dispara MESSAGE_HISTORY_UPDATED con el historial
-    # terminando en "assistant" (ej. justo después de que el avatar
-    # termina de hablar) — recortamos esos mensajes finales para
-    # evitar el error 400 "must end with a user message".
+    # A veces el historial llega terminando en "assistant" (ej. justo después
+    # de que el avatar termina de hablar) — recortamos esos mensajes finales
+    # para evitar el error 400 "must end with a user message".
     while mensajes and mensajes[-1]["role"] != "user":
         mensajes.pop()
+
+    if conocimiento and mensajes:
+        mensajes[-1]["content"] = (
+            f"[Conocimiento relevante de Base44]\n{conocimiento}\n\n"
+            f"[Pregunta del usuario]\n{mensajes[-1]['content']}"
+        )
+
+    # Claude también exige que el primer mensaje sea "user".
+    while mensajes and mensajes[0]["role"] != "user":
+        mensajes.pop(0)
 
     return mensajes
 
@@ -179,24 +281,37 @@ def construir_mensajes_claude(
 # Paso 3: llamar a Claude en streaming
 # ---------------------------------------------------------------------------
 
-def generar_respuesta_stream(mensajes: List[Dict[str, str]]):
+async def generar_respuesta_stream(mensajes: List[Dict[str, str]]) -> AsyncIterator[str]:
     """
-    Generador que hace streaming de la respuesta de Claude, token por token,
-    para que Anam pueda empezar a generar voz/animación antes de que
-    termine la respuesta completa (baja la latencia percibida).
+    Generador asíncrono que hace streaming de la respuesta de Claude, token
+    por token, para que Anam pueda empezar a generar voz/animación antes de
+    que termine la respuesta completa (baja la latencia percibida).
     """
-    with claude_client.messages.stream(
-        model=CLAUDE_MODEL,
-        max_tokens=500,
-        system=SYSTEM_PROMPT,
-        messages=mensajes,
-    ) as stream:
-        for texto in stream.text_stream:
-            yield texto
+    inicio = time.perf_counter()
+    primer_token = True
+    try:
+        async with claude_client.messages.stream(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=mensajes,
+        ) as stream:
+            async for texto in stream.text_stream:
+                if primer_token:
+                    logger.info(
+                        "Claude primer token en %.0f ms",
+                        (time.perf_counter() - inicio) * 1000,
+                    )
+                    primer_token = False
+                yield texto
+    except anthropic.APIError as exc:
+        logger.error("Error de la API de Claude: %s", exc)
+        if primer_token:
+            yield "Perdón, tuve un problema para responder. ¿Me lo repites?"
 
 
 # ---------------------------------------------------------------------------
-# Endpoint que Anam llama (modo Custom LLM, llmId: "CUSTOMER_CLIENT_V1")
+# Modo A (actual): el navegador llama a /chat-stream
 # ---------------------------------------------------------------------------
 
 @app.post("/session-token")
@@ -206,36 +321,55 @@ async def session_token():
     sesión con Anam. Esto evita exponer la API key de Anam en el navegador:
     la key vive únicamente aquí, en el servidor.
     """
+    persona_config: Dict[str, Any] = {
+        "name": "Gemelo Digital de Héctor Padilla",
+        "avatarId": ANAM_AVATAR_ID,
+        "voiceId": ANAM_VOICE_ID,
+        # CUSTOMER_CLIENT_V1 = "yo controlo las respuestas desde el cliente".
+        # Con ANAM_LLM_ID, Anam llama directo a /v1/chat/completions.
+        "llmId": ANAM_LLM_ID or "CUSTOMER_CLIENT_V1",
+        "systemPrompt": SYSTEM_PROMPT,
+        "languageCode": "es",  # evita que el STT transcriba/traduzca a inglés
+        "voiceDetectionOptions": {
+            # Ver notas al final: confirmar en la documentación de Anam en qué
+            # dirección afecta este valor antes de moverlo.
+            "endOfSpeechSensitivity": END_OF_SPEECH_SENSITIVITY,
+            # Cuánto tolera una pausa natural a media oración antes de asumir
+            # que ya terminaste de hablar.
+            "silenceBeforeAutoEndTurnSeconds": SILENCE_BEFORE_AUTO_END_TURN_SECONDS,
+        },
+    }
+    if ANAM_AVATAR_MODEL:
+        persona_config["avatarModel"] = ANAM_AVATAR_MODEL
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {ANAM_API_KEY}",
+    }
+    url = "https://api.anam.ai/v1/auth/session-token"
+
     try:
-        response = requests.post(
-            "https://api.anam.ai/v1/auth/session-token",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {ANAM_API_KEY}",
-            },
-            json={
-                "personaConfig": {
-                    "name": "Gemelo Digital de Héctor Padilla",
-                    "avatarId": ANAM_AVATAR_ID,
-                    "voiceId": ANAM_VOICE_ID,
-                    "llmId": "CUSTOMER_CLIENT_V1",  # fuerza el modo "yo controlo las respuestas"
-                    "systemPrompt": SYSTEM_PROMPT,
-                    "languageCode": "es",  # evita que el STT transcriba/traduzca a inglés
-                    "voiceDetectionOptions": {
-                        # 0 = espera hasta estar seguro de que terminaste; 1 = responde muy rápido.
-                        # Lo bajamos para que no corte a media frase.
-                        "endOfSpeechSensitivity": 0.3,
-                        # Cuánto tolera una pausa natural a media oración antes de asumir
-                        # que ya terminaste de hablar.
-                        "silenceBeforeAutoEndTurnSeconds": 1.5,
-                    },
-                }
-            },
-            timeout=10,
+        response = await http_client.post(
+            url, headers=headers, json={"personaConfig": persona_config}
         )
+
+        # Si el avatar actual no soporta el modelo pedido, no rompemos la
+        # sesión: reintentamos una vez con el modelo que Anam elija.
+        if response.status_code in (400, 422) and "avatarModel" in persona_config:
+            logger.warning(
+                "Anam rechazó avatarModel=%s (%s): %s. Reintentando sin avatarModel.",
+                ANAM_AVATAR_MODEL,
+                response.status_code,
+                response.text[:300],
+            )
+            persona_config.pop("avatarModel")
+            response = await http_client.post(
+                url, headers=headers, json={"personaConfig": persona_config}
+            )
+
         response.raise_for_status()
         return response.json()  # { "sessionToken": "..." }
-    except requests.RequestException as exc:
+    except httpx.HTTPError as exc:
         logger.error("No se pudo generar el session token de Anam: %s", exc)
         return {"error": "No se pudo iniciar la sesión con Anam"}
 
@@ -243,7 +377,7 @@ async def session_token():
 @app.post("/chat-stream")
 async def chat_stream(request: Request):
     """
-    Anam manda algo como:
+    El navegador manda algo como:
     {
         "messages": [
             {"role": "user", "content": "Hola, ¿qué hace Tadah?"},
@@ -257,22 +391,82 @@ async def chat_stream(request: Request):
     if not historial:
         return {"error": "No se recibió historial de conversación"}
 
-    ultima_pregunta = historial[-1].get("content", "")
+    ultima_pregunta = _texto_de_contenido(historial[-1].get("content", ""))
 
-    # Paso 1: conocimiento de Base44
-    conocimiento = obtener_conocimiento_base44(ultima_pregunta)
-
-    # Paso 2: armar mensajes para Claude
+    conocimiento = await obtener_conocimiento_base44(ultima_pregunta)
     mensajes = construir_mensajes_claude(historial, conocimiento)
 
     if not mensajes:
         logger.info("No hay mensaje de usuario válido para responder; se ignora.")
         return StreamingResponse(iter([]), media_type="text/plain")
 
-    # Paso 3: responder en streaming
     return StreamingResponse(
         generar_respuesta_stream(mensajes),
         media_type="text/plain",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Modo B (nuevo): Anam llama directo, formato OpenAI chat.completions + SSE
+# ---------------------------------------------------------------------------
+
+def _chunk_openai(completion_id: str, created: int, delta: Dict[str, Any], finish: Any) -> str:
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": CLAUDE_MODEL,
+        "choices": [
+            {"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}
+        ],
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+async def _stream_openai_sse(mensajes: List[Dict[str, str]]) -> AsyncIterator[str]:
+    completion_id = f"chatcmpl-gemelo-{int(time.time() * 1000)}"
+    created = int(time.time())
+
+    yield _chunk_openai(completion_id, created, {"role": "assistant"}, None)
+    async for texto in generar_respuesta_stream(mensajes):
+        yield _chunk_openai(completion_id, created, {"content": texto}, None)
+    yield _chunk_openai(completion_id, created, {}, "stop")
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    """
+    Endpoint compatible con OpenAI que Anam llama desde sus servidores cuando
+    la persona usa un LLM registrado (POST https://api.anam.ai/v1/llms con
+    llmFormat "openai"). Anam exige streaming SSE.
+    """
+    if ANAM_LLM_SECRET:
+        if request.headers.get("authorization", "") != f"Bearer {ANAM_LLM_SECRET}":
+            raise HTTPException(status_code=401, detail="No autorizado")
+
+    body: Dict[str, Any] = await request.json()
+    historial = body.get("messages", [])
+
+    ultima_pregunta = ""
+    for turno in reversed(historial):
+        if turno.get("role") == "user":
+            ultima_pregunta = _texto_de_contenido(turno.get("content", ""))
+            break
+
+    conocimiento = await obtener_conocimiento_base44(ultima_pregunta)
+    mensajes = construir_mensajes_claude(historial, conocimiento)
+
+    if not mensajes:
+        # Sondeos de Anam (prompts pequeños de prueba) o historial sin turno
+        # de usuario: igual hay que responder con un stream válido.
+        logger.info("Sin mensaje de usuario válido; se responde con stream vacío.")
+        mensajes = [{"role": "user", "content": "Hola"}]
+
+    return StreamingResponse(
+        _stream_openai_sse(mensajes),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -283,19 +477,33 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Notas para quien vaya a completar esto:
+# Cómo activar el modo B (servidor):
 #
-# 1. El nombre y el formato exacto del endpoint que espera Anam
-#    ("/chat-stream", el shape del JSON de entrada/salida) hay que
-#    confirmarlo contra la documentación vigente de Anam antes de
-#    conectar esto de verdad — este esqueleto sigue el patrón general
-#    de sus ejemplos, pero Anam podría pedir un formato de streaming
-#    específico (ej. Server-Sent Events con un formato particular).
+# 1. Despliega este archivo y confirma que https://TU-APP/health responde.
+# 2. Registra el LLM en Anam (una sola vez):
 #
-# 2. La función getKnowledgeForQuery todavía no existe en Base44 —
-#    hay que crearla ahí primero, y definir qué regresa exactamente
-#    (texto plano, o un JSON con varios fragmentos).
+#    curl -X POST "https://api.anam.ai/v1/llms" \
+#      -H "Authorization: Bearer $ANAM_API_KEY" \
+#      -H "Content-Type: application/json" \
+#      -d '{
+#        "displayName": "Gemelo HP (Claude + Base44)",
+#        "urls": [{"url": "https://TU-APP/v1/chat/completions"}],
+#        "llmFormat": "openai",
+#        "modelName": "claude-sonnet-5",
+#        "secret": "EL_MISMO_VALOR_DE_ANAM_LLM_SECRET"
+#      }'
 #
-# 3. Falta manejar autenticación real hacia Base44 (asServiceRole)
-#    según lo que pida su documentación de backend functions.
+# 3. Copia el `id` de la respuesta a ANAM_LLM_ID y redespliega.
+# 4. En el frontend ya no hace falta escuchar MESSAGE_HISTORY_UPDATED ni
+#    llamar a /chat-stream: Anam habla solo. Mantén /chat-stream mientras
+#    migras para poder volver atrás quitando ANAM_LLM_ID.
+# 5. Corre la prueba de validación del LLM en Anam Lab antes de producción.
+#
+# Notas pendientes:
+# - La función getKnowledgeForQuery debe existir en Base44 y definir qué
+#   regresa exactamente (hoy se espera {"knowledge": "texto"}).
+# - endOfSpeechSensitivity: el comentario original decía "0 = espera hasta
+#   estar seguro, 1 = responde muy rápido", pero la guía de rendimiento de
+#   Anam dice que un valor alto puede retrasar la decisión de fin de turno.
+#   Confirma la dirección real en la documentación antes de cambiarlo.
 # ---------------------------------------------------------------------------
