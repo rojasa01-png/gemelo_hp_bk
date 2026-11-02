@@ -1,0 +1,6 @@
+livekit-agents[anam,anthropic,deepgram,elevenlabs]~=1.8
+httpx
+python-dotenv
+# solo para token_server.py
+fastapi
+uvicorn[standard]
