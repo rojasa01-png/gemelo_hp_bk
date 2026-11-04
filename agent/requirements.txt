@@ -1,4 +1,4 @@
-livekit-agents[anam,anthropic,deepgram,elevenlabs]~=1.8
+livekit-agents[anam,anthropic,deepgram,elevenlabs,openai]~=1.8
 httpx
 python-dotenv
 # solo para token_server.py
